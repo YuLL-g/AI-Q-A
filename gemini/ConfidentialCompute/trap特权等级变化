@@ -1,0 +1,80 @@
+### 怎么确定不同的代码具体在哪个mode下运行？ecall只能trap一个特权等级吗，能不能直接从VS-mode 直接 trap到m-mode？
+
+---
+这两个问题都非常深入，触及了 RISC-V 体系结构在特权级管理和异常路由（Trap Routing）上的核心设计哲学！
+
+我们分两部分来解答：第一部分解密“如何确定代码运行在哪个模式”，第二部分揭开 `ecall` 跨级跳转的真相。
+
+---
+
+### 一、 怎么确定一段具体的代码是在哪个 Mode 下运行的？
+
+在 RISC-V 中，要判断当前代码运行在哪个模式，其实是一个**“只可意会，不可直接言传”**的有趣设计。
+
+#### 1. 为什么不能直接写代码查？（架构的玄机）
+您可能会想：有没有一条指令（比如 `read_current_mode()`），我一调用，CPU 就返回“你现在在 VS-mode”？
+**答案是：RISC-V 故意没有提供这样的指令！**
+*   **原因**：为了完美的虚拟化。如果 Linux KVM (VS-mode) 能通过一条指令查出自己运行在 VS-mode（而不是最高权限的 HS/S-mode），它就会发现自己被“虚拟化/降权”了，可能会导致一些依赖绝对权限的内核逻辑报错。RISC-V 的设计哲学是：**让下层操作系统陷入完美的幻觉，永远不知道自己被降级了。**
+
+#### 2. 那作为开发者，怎么确定代码在哪个 Mode？
+通常有以下三种方法：
+
+*   **方法 A：看启动链的“接力棒”（静态分析）**
+    模式是由**上一段代码降权跳转时决定的**。
+    *   如果您写的是系统的第一行代码（BootROM），那必定是 **M-mode**。
+    *   如果您的代码是被 OpenSBI 通过设置 `mstatus.MPP = S` 然后 `mret` 启动的，那您的代码就在 **HS-mode** (因为没开 `V` 标志)。
+    *   如果您的代码是被 Salus 设置 `hstatus.SPV = 1` 然后 `sret` 启动的，那您的代码就在 **VS-mode**。
+*   **方法 B：通过“踩地雷”测试（CSR 探测法）**
+    如果一段未知的代码想测出自己的权限，可以尝试去读写只有高权限才有的**状态寄存器（CSR）**：
+    *   尝试读取 `mhartid`（M-mode 专属）。如果代码崩溃了（触发非法指令异常 Trap），说明**不在 M-mode**。
+    *   接着尝试读取 `hgatp`（HS-mode 专属）。如果又崩溃了，说明**不在 HS-mode**。
+    *   最后读取 `sstatus` 没崩溃，那说明当前在 **VS-mode 或 S-mode**。
+*   **方法 C：看 JTAG / 调试器（上帝视角）**
+    如果您使用 QEMU 模拟器或者硬件 JTAG 调试器连上 CPU，调试器内部可以直接读取 CPU 硬件的隐藏引脚状态（`priv` 状态位），那里清清楚楚地写着当前是 M(3)、S/HS(1) 还是 U(0)，以及 V(1/0) 标志位。
+
+---
+
+### 二、 `ecall` 只能 trap 一个特权等级吗？能不能从 VS-mode 直接 trap 到 M-mode？
+
+这是一个极其容易被误解的知识点！
+
+直接给您最震撼的答案：**在 RISC-V 硬件的默认状态下，不论你在哪个模式（U, VS, HS），只要你执行 `ecall` 或发生任何异常，硬件都会【直接一步跨越】 Trap 到 M-mode！**
+
+也就是说，**直接从 VS-mode 跃升到 M-mode 才是硬件的“出厂默认行为”！** 只能 Trap 一个等级（比如 VS 陷入 HS）反而是软件后期配置出来的结果。
+
+这套机制叫做 **“异常委派（Trap Delegation）”**。我们来详细看看它是怎么运作的：
+
+#### 1. 硬件的默认设定：万剑归宗（直达 M-mode）
+RISC-V 认为，M-mode 是绝对的信任根。所以，一旦系统出现任何风吹草动：
+*   App (U-mode) 执行 `ecall` ➡️ 默认直达 **M-mode**
+*   Linux (VS-mode) 执行 `ecall` ➡️ 默认直达 **M-mode**
+*   Salus (HS-mode) 执行 `ecall` ➡️ 默认直达 **M-mode**
+
+如果保持这个默认设定，系统的效率会极其低下！想象一下：您的普通 App 想打印一行字（发 `ecall` 求助 Linux 内核），结果 CPU 直接越过 Linux 和 Salus，一脚踢给了底层的 OpenSBI (M-mode)。OpenSBI 一看这事儿不归我管，还得再通过软件层层下发给 Linux，性能就完全崩溃了。
+
+#### 2. 软件的改造：异常委派机制（`medeleg` 寄存器）
+为了解决性能问题，M-mode (OpenSBI) 在系统刚启动时，会配置一个极其关键的 M-mode 寄存器：**`medeleg`（Machine Exception Delegation，机器异常委派）**。
+
+`medeleg` 就像是一份**“权力下放清单”**，它告诉 CPU 硬件：“以后哪些异常别来烦我，直接交给下层的 HS-mode 处理。”
+
+在 RISC-V 规范中，不同的 `ecall` 会产生不同的**异常代码（Exception Code）**：
+*   Code 8: 来自 U-mode / VU-mode 的 ecall
+*   Code 9: 来自 HS-mode 的 ecall
+*   Code 10: 来自 VS-mode 的 ecall
+*   Code 11: 来自 M-mode 的 ecall
+
+**在 CoVE (Salus) 架构下，OpenSBI 会做什么？**
+OpenSBI 会在 `medeleg` 寄存器中，把 第 8 位和第 10 位 置为 `1`。
+这意味着：OpenSBI 告诉硬件：**“以后凡是来自 App (8) 和 HostVM/TVM (10) 的 `ecall`，我 (M-mode) 都不管了，请硬件直接把它们拦截在 HS-mode，交给 Salus 处理！”**
+
+而第 9 位（来自 HS-mode 的 ecall）保持为 `0`。这意味着：**“Salus (HS-mode) 遇到了搞不定的事发起的 `ecall`，不要委派，直接送到我 M-mode 这里来。”**
+
+#### 3. 终极解答
+
+*   **能不能从 VS-mode 直接 trap 到 M-mode？**
+    **绝对能！** 只要 OpenSBI 不在 `medeleg` 寄存器里把“Code 10”这一个 bit 置位为 1，那么 Linux KVM (VS-mode) 执行一行 `ecall` 汇编指令，CPU 就会无视中间的 Salus (HS-mode)，瞬间直达 M-mode (OpenSBI) 的异常处理入口。
+*   **为什么平时我们看到的是 VS-mode 陷入 HS-mode？**
+    因为在 Salus 项目中，OpenSBI 已经提前写好了那份“权力下放清单（委派）”。硬件在执行 `ecall` 升权时，查了清单，发现 M-mode 说“这事交给 HS-mode 办”，于是硬件就顺水推舟，把原本应该跃升到 M-mode 的 Trap，“降落”在了 HS-mode 的异常向量表中（`stvec`），唤醒了 Salus。
+
+**一句话总结：**
+RISC-V 的 `ecall` 默认是**“一步登天”**（直达 M-mode）；我们平时看到的**“逐级上报”**，是高特权级固件通过**“硬件异常委派寄存器”**主动下放权力的结果。
